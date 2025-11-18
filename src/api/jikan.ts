@@ -1,6 +1,84 @@
 export const JIKAN_API_BASE_URL = "https://api.jikan.moe/v4";
+const JIKAN_RATE_LIMIT_DELAY = 2500; // 2.5 seconds between requests
+const MAX_RETRY_ATTEMPTS = 3;
+const RETRY_DELAY_MS = 5000;
 
-// Basic structure for common related entities (genres, studios, themes)
+// --- Request Queue ---
+let lastRequestTime = 0;
+const requestQueue: (() => Promise<any>)[] = [];
+let isProcessingQueue = false;
+
+async function processQueue() {
+  if (isProcessingQueue || requestQueue.length === 0) return;
+
+  isProcessingQueue = true;
+
+  const now = Date.now();
+  const timeSinceLastRequest = now - lastRequestTime;
+  const delayNeeded = JIKAN_RATE_LIMIT_DELAY - timeSinceLastRequest;
+
+  if (delayNeeded > 0) {
+    await new Promise((resolve) => setTimeout(resolve, delayNeeded));
+  }
+
+  lastRequestTime = Date.now();
+  const nextRequest = requestQueue.shift();
+
+  if (nextRequest) {
+    try {
+      await nextRequest();
+    } finally {
+      isProcessingQueue = false;
+      processQueue(); // process next
+    }
+  } else {
+    isProcessingQueue = false;
+  }
+}
+
+function enqueueRequest<T>(requestFn: () => Promise<T>): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const runRequest = async () => {
+      try {
+        resolve(await requestFn());
+      } catch (err) {
+        reject(err);
+      }
+    };
+
+    requestQueue.push(runRequest);
+    processQueue();
+  });
+}
+
+// --- Retry Handler ---
+async function fetchWithRetry(
+  url: string,
+  options: RequestInit = {},
+  attempt = 0
+): Promise<Response> {
+  try {
+    const res = await fetch(url, options);
+
+    if (res.status === 429 && attempt < MAX_RETRY_ATTEMPTS) {
+      console.warn(
+        `Rate limit hit (429). Retrying in ${RETRY_DELAY_MS / 1000}s...`
+      );
+      await new Promise((resolve) => setTimeout(resolve, RETRY_DELAY_MS));
+      return fetchWithRetry(url, options, attempt + 1);
+    }
+
+    return res;
+  } catch (err: any) {
+    if (err instanceof DOMException && err.name === "AbortError") {
+      throw err;
+    }
+    console.error("Network error:", err);
+    throw err;
+  }
+}
+
+// --- Types ---
 interface JikanDataItem {
   mal_id: number;
   type: string;
@@ -8,15 +86,14 @@ interface JikanDataItem {
   url: string;
 }
 
-// Interface for aired dates
 interface JikanAired {
-  from: string | null; // e.g., "2002-10-03T00:00:00+00:00"
+  from: string | null;
   to: string | null;
   prop: {
     from: { day: number | null; month: number | null; year: number | null };
     to: { day: number | null; month: number | null; year: number | null };
   };
-  string: string; // e.g., "Oct 3, 2002 to Mar 25, 2007"
+  string: string;
 }
 
 export interface Anime {
@@ -33,20 +110,18 @@ export interface Anime {
   synopsis: string;
   type: string;
   episodes: number;
-  status: string; // e.g., "Finished Airing", "Currently Airing"
-  aired: JikanAired; // New field for airing dates
+  status: string;
+  aired: JikanAired;
   score: number;
   members: number;
-  genres: JikanDataItem[]; // New field for genres
-  studios: JikanDataItem[]; // New field for studios
-  themes: JikanDataItem[]; // New field for themes
-  demographics: JikanDataItem[]; // New field for demographics
+  genres: JikanDataItem[];
+  studios: JikanDataItem[];
+  themes: JikanDataItem[];
+  demographics: JikanDataItem[];
   producers: { mal_id: number; name: string }[];
   licensors: { mal_id: number; name: string }[];
   source: string | null;
   rating: string | null;
-
-  // Add other fields you expect to use, e.g., 'rank', 'popularity', 'source', 'rating'
 }
 
 export interface JikanPagination {
@@ -65,31 +140,34 @@ export interface JikanApiResponse<T> {
   pagination?: JikanPagination;
 }
 
-// Function to fetch anime by search term
+// --- API Functions (NOW using queue + retry) ---
 export const searchAnime = async (
   query: string,
-  page: number = 1,
-  limit: number = 25, // Default limit
-  signal?: AbortSignal // Add AbortSignal parameter
-): Promise<JikanApiResponse<Anime[]>> => {
-  const response = await fetch(
-    `${JIKAN_API_BASE_URL}/anime?q=${encodeURIComponent(
+  page = 1,
+  limit = 25,
+  signal?: AbortSignal
+): Promise<JikanApiResponse<Anime[]>> =>
+  enqueueRequest(async () => {
+    const url = `${JIKAN_API_BASE_URL}/anime?q=${encodeURIComponent(
       query
-    )}&page=${page}&limit=${limit}`,
-    { signal } // Pass the signal to the fetch call
-  );
-  if (!response.ok) {
-    throw new Error(`HTTP error! status: ${response.status}`);
-  }
-  return response.json();
-};
+    )}&page=${page}&limit=${limit}`;
+
+    const res = await fetchWithRetry(url, { signal });
+
+    if (!res.ok) throw new Error(`HTTP error ${res.status}`);
+
+    return res.json();
+  });
 
 export const getAnimeDetails = async (
   id: number
-): Promise<JikanApiResponse<Anime>> => {
-  const response = await fetch(`${JIKAN_API_BASE_URL}/anime/${id}`);
-  if (!response.ok) {
-    throw new Error(`HTTP error! status: ${response.status}`);
-  }
-  return response.json();
-};
+): Promise<JikanApiResponse<Anime>> =>
+  enqueueRequest(async () => {
+    const url = `${JIKAN_API_BASE_URL}/anime/${id}`;
+
+    const res = await fetchWithRetry(url);
+
+    if (!res.ok) throw new Error(`HTTP error ${res.status}`);
+
+    return res.json();
+  });
